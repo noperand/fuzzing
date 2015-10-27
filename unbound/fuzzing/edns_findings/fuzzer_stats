@@ -1,0 +1,25 @@
+start_time     : 1445892592
+last_update    : 1445908939
+fuzzer_pid     : 23404
+cycles_done    : 1
+execs_done     : 556092
+execs_per_sec  : 35.44
+paths_total    : 41
+paths_favored  : 14
+paths_found    : 33
+paths_imported : 0
+max_depth      : 5
+cur_path       : 27
+pending_favs   : 0
+pending_total  : 21
+variable_paths : 0
+bitmap_cvg     : 0.12%
+unique_crashes : 2
+unique_hangs   : 0
+last_path      : 1445907665
+last_crash     : 1445892603
+last_hang      : 0
+exec_timeout   : 10000
+afl_banner     : parse_edns_from_pkt_fuzz
+afl_version    : 1.85b
+command_line   : afl-fuzz -m 4096 -t 10000 -i edns_samples/ -o edns_findings/ ./parse_edns_from_pkt_fuzz @@

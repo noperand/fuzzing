@@ -1,0 +1,399 @@
+* The listener for DNS traffic appears to be implemented in services/listen_dnsport.c.
+
+* Important structures:
+  * listen_dnsport -- Used when listening for queries. Maintains a list of
+    query-listen sockets.
+  * comm_point -- Network communication point. 
+    * Includes a file descriptor for the socket. Flags are used to indicate 
+      various stages of communication. 
+    * Some specific points of interest based on the comm_point_type enumeration
+      include comm_udp which should be used when handling normal DNS queries. 
+      The comm_tcp comm_point_type might be used in zone transfers.
+    * A comm_point_callback_t function pointer exists in this structure and is 
+      called after successful network communication in comm_point_udp_callback().
+      This could be a juicy target for hijacking control through memory 
+      corruption.
+
+* Buffer Management! Or sldns_buffer and friends -- sldns/sbuffer.(c|h):
+  !!! NOTE: These are all INLINEd unless otherwise specified. !!!
+  !!! NOTE: All assertions are dependent on NDEBUG being undefined. !!!
+  !!! NOTE: By default, UNBOUND_DEBUG is undefined and as a result, NDEBUG is defined. !!!
+
+  * sldns_buffer (struct) -- Contains members for reflecting the current buffer 
+    position (_position), the read/write limit (_limit), the maximum capacity 
+    (_capacity), the actual data in the buffer (*data), a flag for "fixing" the
+    buffer so that it may not be resized (_fixed, default is 1), and an error 
+    status. This is also typedef'ed to just "sldns_buffer".
+  * sldns_buffer_invariant() -- If no debugging is enabled, this does nothing.
+    Otherwise, it performs assertions for checking that the buffer is non-NULL,
+    the limit is greater than or equal to the current position, the capacity is
+    greater than or equal to the limit, and that the buffer data is non-NULL.
+  * sldns_buffer_new() -- Calls malloc() with the size of the sldns_buffer 
+    structure and verifies the return value is non-null. Another call to 
+    malloc() occurs, passing in the unsigned capacity and assigning the 
+    resulting pointer to the _data member of the newly allocated sldns_buffer. 
+    The _position, _fixed, and _status_err members are all initialized to zero.
+    The _limit and _capacity are both set to the capacity argument.
+  * sldns_buffer_new_frm_data()
+  * sldns_buffer_clear() -- Sets the buffer position to 0 and sets the buffer 
+    limit to the current capacity. According to comments, this clears the 
+    buffer and readies it for writing.
+  * sldns_buffer_flip() -- The limit on the buffer is set to the current 
+    position and the position is set to 0. According to comments, this function
+    readies the buffer for reading what has been written.
+    * There is a call to sldns_buffer_invariant() prior to this operation. 
+      However, this function does nothing in the default build configuration. 
+      If the currently tracked _position in the buffer is in an unexpected 
+      state, this could lead to subsequent reads of neighboring heap memory, 
+      outside the actual boundaries of the memory currently allocated and 
+      tracked in the sldns_buffer.
+  * sldns_buffer_rewind() -- Simply rewinds to the beginning of the buffer by 
+    setting the position to 0.
+  * sldns_buffer_position() -- Simply fetches the current buffer position by 
+    dereferencing the passed buffer pointer.
+  * sldns_buffer_set_position() -- Asserts that the provided mark is not beyond
+    the limit of the buffer and assigns the mark to the buffer position.
+  * sldns_buffer_skip() -- Increments the buffers position by the provided 
+    number of bytes but asserts that the provided count plus the current 
+    position does not exceed the limit of the buffer.
+    * This assertion does nothing in the default build configuration. The 
+      provided size can easily overflow the position or potentially contribute 
+      to a read or write outside the boundaries of the buffer.
+    * It is important to note that the _position member of the sldns_buffer 
+      structure is a size_t (unsigned) while the provided count is an ssize_t 
+      (signed). The count (signed) value is added to and assigned to the 
+      _position (unsigned) member.
+  * sldns_buffer_limit() -- Simply returns the limit of the buffer by 
+    dereferencing the provided buffer pointer.
+  * sldns_buffer_capacity() -- Simply returns the capacity of the buffer by 
+    dereferencing the provided buffer pointer.
+  * sldns_buffer_set_capacity() -- Following a call to sldns_buffer_invariant()
+    (which does nothing if NDEBUG is defined), an assert is included that 
+    attempts to ensure the passed in capacity is greater than or equal to the 
+    current position in the buffer (_position member). realloc() is then used 
+    to extend the heap-based allocation tracked by the structure according to 
+    the provided capacity. The resulting pointer is then assigned to the _data 
+    member and the _limit and _capacity are set to the passed in capacity. 
+    Returns 1 on success.
+  * sldns_buffer_reserve() -- Starts with a call to sldns_buffer_invariant() 
+    which does nothing if NDEBUG is defined, continues with a simple assert that
+    ensures the _fixed member is non-NULL, and if the provided amount plus the 
+    current _position is greater than the capacity, a new capacity is calculated
+    by multiplying the current capacity by 3 and dividing by 2. This 
+    new_capacity is then checked to see if the current _position plus the 
+    provided is larger than the new_capacity. If so, the value of the 
+    new_capacity is set to the current _position value plus the provided amount.
+    If a call to sldns_buffer_set_capacity() fails with the new_capacity, the _
+    status_err member is set to 1 and 0 is returned. Otherwise, the _limit 
+    member is set to the new _capacity in the buffer and 1 is returned.
+  * sldns_buffer_at() -- Asserts that the provided relative location in the 
+    buffer does not exceed the limit of the buffer, returning a pointer to the
+    buffer data at the provided offset. 
+  * sldns_buffer_begin() -- Uses sldns_buffer_at() to return a pointer to the 
+    beginning of the data *in* the buffer.
+  * sldns_buffer_end() -- Uses sldns_buffer_at() to return a pointer to the end
+    of the data *in* the buffer (using the limit, not the capacity).
+  * sldns_buffer_current() -- Simply returns a pointer to the data in the 
+    buffer at the current position tracked by the sldns_buffer struct.
+  * sldns_buffer_remaining_at() -- Asserts the provided relative location does 
+    not exceed the limit of the buffer, otherwise returning an unsigned integer
+    representing what remains after subtracting the relative offset from the
+    limit.
+  * sldns_buffer_remaining() -- Uses sldns_buffer_remaining_at() to determine 
+    how much remains according to the limit, based on the currently tracked 
+    buffer position.
+  * sldns_buffer_available_at() -- Takes a count and a relative offset where 
+    sldns_buffer_remaining_at() is used to determine whether there are count 
+    bytes available. Returns a boolean result.
+  * sldns_buffer_available() -- Takes a count and determines if the buffer has 
+    count bytes available from the current buffer position.
+  * sldns_buffer_write_at() -- Asserts that the buffer has enough bytes to 
+    accomodate the provided size of the data being written, subsequently 
+    performing a memcpy() to the buffer factoring in the provided relative offset 
+    while being constrained to the provided count for size.
+  * sldns_buffer_write() -- Writes the provided data, constrained by count 
+    bytes, using sldns_buffer_write_at() and providing the current position as 
+    the relative offset to begin writing. The position is then incremented by 
+    count bytes.
+  * sldns_buffer_write_string_at() -- Uses sldns_buffer_write_at() to write the
+    provided null-terminated string to the provided offset, constraining the 
+    length to strlen() of the provided string.
+  * sldns_buffer_write_string() -- Uses sldns_buffer_write() to write a 
+    null-terminated string to the buffer, constraining the length to strlen()
+    of the provided string.
+  * sldns_buffer_write_u8_at() -- Writes the provided byte at the relative 
+    offset in the buffer after asserting that sldns_buffer_available_at() 
+    indicates all is well with the args. Uses a direct array index for the 
+    write, which makes sense.
+  * sldns_buffer_write_u8() -- Writes the provided byte of data at the current 
+    position in the buffer using sldns_buffer_write_u8_at(). The position is 
+    also incremented by the size of the provided data.
+  * sldns_buffer_write_u16_at() -- Writes the provided 16-bit unsigned integer 
+    at the indicated position in the buffer after an assertion with 
+    sldns_buffer_available_at(). The actual write uses sldns_write_uint16().
+  * sldns_buffer_write_u16() -- Writes the provided 16-bit unsigned integer to 
+    the current position in the buffer using sldns_buffer_write_u16_at(). The 
+    _position member is used. The _position member is also incremented by the 
+    size of the data which will consistently be 2 bytes.
+  * sldns_buffer_write_u32_at() -- Writes a 32-bit unsigned integer to the 
+    indicated position in the buffer after a simple assert wrapping 
+    sldns_buffer_available_at() that will take a consistent 4-byte integer value
+    to verify space is available. The value is then written using 
+    sldns_write_uint32().
+  * sldns_buffer_write_u32() -- Uses sldns_buffer_write_u32_at() to write a 
+    32-bit integer to the current position as tracked by the buffer structure 
+    (_position member). Also increments the current position by the size of the
+    data which should consistently be four bytes.
+  * sldns_buffer_read_at() -- Performs an assert that there is data in the 
+    buffer available at the provided offset for the expected byte count before 
+    performing a direct memcpy() to the provided (void *) buffer. Does not 
+    change the currently tracked position in the buffer.
+  * sldns_buffer_read() -- Uses sldns_buffer_read_at() to read from the buffer 
+    at the current _position for count bytes and increments the tracked buffer 
+    position by count bytes.
+  * sldns_buffer_read_u8_at() -- After an assert using sldns_buffer_available_at()
+    that verifies there is enough space in the buffer at the requested position,
+    the value stored at the requested position as pointed to by the _data 
+    member is returned (unsigned byte).
+  * sldns_buffer_read_u8() -- Uses sldns_buffer_read_u8_at() to read an unsigned
+    byte from the position currently pointed to by the _position member and 
+    increment the _position based on size (1) of the result.
+  * sldns_buffer_read_u16_at() -- After an assert using sldns_buffer_available_at()
+    to verify there is buffer at the requested offset, sldns_read_uint16() is 
+    used to read a 2 byte integer from the requested offset.
+  * sldns_buffer_read_u16() -- Uses sldns_buffer_read_u16_at() to attempt a read
+    of the buffer at the current location pointed to by the _position member and
+    returns the result after incrementing the currently tracked position based 
+    on the data size.
+  * sldns_buffer_read_u32_at() -- After an assert attempting to verify that 
+    there is buffer at the requested location, sldns_read_uint32() is used to 
+    read four bytes from the buffer at the requested offset.
+  * sldns_buffer_read_u32() -- uses sldns_buffer_read_u32_at() to attempt to 
+    read from the buffer relative to the current _position, incrementing the 
+    _position by the size of the data and returning the result.
+  * sldns_buffer_status() -- Return the _status_err member of the current buffer
+    structure, cast to a signed integer.
+  * sldns_buffer_status_ok() -- If the provided buffer pointer is non-null and 
+    the _status_err member returned from sldns_buffer_status() is equal to zero,
+    will return 1 (or true). Otherwise, zero will be returned.
+  * sldns_buffer_printf() -- All operations depend on a true result from 
+    sldns_buffer_status_ok() on the provided sldns_buffer. If true, 
+    sldns_buffer_invariant() is called on the buffer, which does nothing if 
+    NDEBUG is defined. An assert() also checks to see if the _limit member 
+    equals the _capacity member. This does nothing if NDEBUG is specified as 
+    well. sldns_buffer_remaining() is then called with the buffer with the 
+    result being used as the maximum length in a vsnprintf() call, writing to 
+    the data buffer via the pointer returned from sldns_buffer_current(). The 
+    result is checked for error with the _status_err member of the sldns_buffer
+    struct being set if so, returning -1 for fail. If the written amount is 
+    greater than the amount remaining as determined before, a call to 
+    sldns_buffer_reserve() is used to reserve one additional byte (cast to 
+    size_t) to the number of bytes written in the previous vsnprintf() call. If
+    this fails, the _status_err member is to 1 and -1 is returned. The provided
+    format string and arguments are used to write to the same buffer as before 
+    but with a reassessment of how much space is remaining through a call to 
+    sldns_buffer_remaining(). If all has gone well throughout this ordeal, 
+    additional reservations or not, the current buffer _position is set to what
+    was written, beginning as the results on the number of written bytes in the
+    first vsnprintf() call.
+  * sldns_buffer_free() -- If buffer is null, bail. Otherwise check to see if 
+    the _fixed member is null. If not, call free() on the _data member. 
+    Regardless of the _fixed flag status, free the sldns_buffer pointed to in 
+    the only argument.
+  * sldns_buffer_export() -- Caller seems to be responsible for free(). The 
+    _fixed member of the provided buffer is explicitly set to 1 prior to 
+    returning the _data member (pointer). 
+  * sldns_buffer_copy() -- Uses sldns_buffer_limit() to fetch the _limit of the
+    buffer and compare that to the capacity of the resulting buffer through a 
+    call to sldns_buffer_capacity() which returns the _capacity member. This 
+    limits the maximum copying length which is capped at the current capacity of the 
+    result buffer (to be written to). Can result in truncation if size 
+    difference. This is followed with a call to sldns_buffer_clear() which 
+    resets the buffer for writing (data is not zeroed out at this time). 
+    sldns_buffer_write() is then used to write to the resulting buffer starting
+    from the beginning of the from buffer through the resulting pointer from an
+    sldns_buffer_begin() call. The maximum length of the write, as calculated 
+    previously, is also provided in the call. sldns_buffer_flip() is then
+    called on the resulting sldns_buffer, setting the _limit and resetting the 
+    _position to the beginning to get ready for reading.
+  * sldns_buffer_init_frm_data() -- Clears the passed in sldns_buffer struct 
+    (pointer), assigns the provided data pointer to the struct member and sets 
+    the _limit and _capacity members to the indicated size. Also sets the _fixed
+    member to 1.
+
+* Candidate functions for in-depth review:
+  * comm_point_udp_callback() -- util/netevent.c
+    * listen_create() in services/listen_dnsport.c calls both 
+      comm_point_create_udp() and comm_point_create_udp_ancil() during 
+      initialization.
+    * This callback is registered using libevent primitives by 
+      comm_point_create_udp() on line 1553 of util/netevent.c.
+    * Takes the file descriptor, a short integer identifying the event, and a 
+      void pointer that is cast to a comm_point struct. 
+    * Performs some simple assertions on the provided struct, and clears the 
+      buffer pointed to by the comm_point struct through a call to 
+      sldns_buffer_clear().
+      * Sets the buffer position to 0 and sets the limit to the capacity. This 
+      	essentially clears the buffer and readies it for writing.
+    * Two logging assertions are performed to ensure the fd is not -1 and 
+      sldns_buffer_remaining() on the c member buffer pointer returns something
+      greater than zero.
+      * The log_assert() calls involved here are dependent on UNBOUND_DEBUG 
+      	being defined. By default, UNBOUND_DEBUG is undefined which leads to 
+	log_assert() calls doing nothing.
+    * recvfrom() is then called to read from the provided file descriptor 
+      writing to the beginning of the buffer pointed to by sldns_buffer_begin()
+      on the c member buffer pointer. The limit on the amount received is 
+      specified through a call to sldns_buffer_remaining() on the c member 
+      buffer pointer.
+    * sldns_buffer_skip() is then called with the number of received bytes to 
+      increment the tracked _position of the buffer. sldns_buffer_flip() is 
+      then called on the buffer to ready the buffer for reading from the 
+      beginning.
+    * The reply srctype member is set to zero before calling fptr_ok() to 
+      verify the function pointer that the callback member of the sldns_buffer 
+      pointed to in the reply structure (rep.c). The 
+      fptr_whitelist_comm_point() function checks the function pointer to
+      ensure that it points explicitly to any of the following functions:
+      * worker_handle_request()
+      	* The reply buffer (rep.c->buffer -- raw
+	  data) is provided as second argument, a void pointer. This is ultimately 
+	  cast to be a pointer to a worker struct during initialization.
+        * Ensures the passed in error integer is not equal to anything but 
+	  NETEVENT_NOERROR before proceeding.
+	* There is special handling if USE_DNSTAP is defined but that is not defined 
+	  in the default build (undef in config.h).
+	* acl_list_lookup() is called dereferencing the local worker struct pointer, 
+	  passing a pointer to worker->daemon->acl. This is a simple implementation 
+	  providing a way to block/allow regions or a tree of IP addresses. In this 
+	  case, acl_list_lookup() uses addr_tree_lookup() and if the address is 
+	  found, the persisted control action for that ACL entry is returned. 
+	  Otherwise, acl_deny (zero) is returned by default.
+	* A call is then made to deny_refuse_all(), which simply calls deny_refuse() 
+	  and handles the desired action according to the current ACL.
+	* The code then calls worker_check_request() providing a pointer to the 
+	  request buffer and the worker structure pointer.
+	  * This function performs a variety of checks on the provided data to ensure 
+	    it is a well-formed request.
+	  * If the "limit" (length?) of the packet as returned by sldns_buffer_limit()
+	    is less than LDNS_HEADER_SIZE (12 bytes) the request is too short and -1 
+	    is returned.
+	  * If the "limit" (length?) of the packet as returned by sldns_buffer_limit()
+	    is greater than NORMAL_UDP_SIZE (512 bytes) and the current worker has 
+	    been configured to be "hardened" against large queries, -1 is returned as 
+	    the request is too large.
+	  * This function performs a variety of checks against the provided request. 
+	    This would definitely be worth fuzzing and assessing code coverage.
+	  * worker_check_request() should return 0 if all is well.
+	* The number of queries handled by this worker is then incremented by 1.
+	* A call is then made to query_info_parse() passing in the address of the 
+	  query_info structure allocated locally and a pointer to the comm_point 
+	  buffer.
+	  * query_info_parse() continues by performing some checks on the size of the 
+	    request, specific bits being set, and skipping past the header to derive 
+	    pointers to the qname member and extract unsigned 16 bit integers for the 
+	    qtype and qclass members of the query_info structure.
+	* There is some special handling based on the environmental configuration of 
+	  the worker and whether query logging is enabled. If so, that is performed 
+	  now.
+	* The query_info (qinfo) is then checked to see if it is a zone transfer 
+	  (LDNS_RR_TYPE_AXFR). If this is the case, sldns_buffer_rewind() is called 
+	  on the buffer (c->buffer) and LDNS_QR_SET (query bit) and LDNS_RCODE_SET are 
+	  called on the beginning of the buffer. If extended stats are needed as 
+	  specified by the worker, worker stats are derived. We then jump to 
+	  send_reply through a goto which sets a return code of 1 and returns.
+	* The code continues with a call to parse_edns_from_pkt() passing in a pointer
+	  to the data buffer and a pointer to the locally allocated edns_data 
+	  stucture.
+	  * parse_edns_from_pkt() starts with multiple log_assert() calls that 
+	    ultimately do nothing in the default build configuration.
+	  * There are multiple checks performed here. This might be a good candidate 
+	    function to cover in fuzzing.
+	  * pkt_dname_len() is called on the data, which must return 1 to continue.
+	    * pkt_dname_len() begins by making sure the buffer has not reached its 
+	      _limit ( in terms of reading). Returns 0 if so.
+	    * Reads an unsigned 8 bit integer into 'labellen'. If the bit at 0xc0 is 
+	      currently set, the label is treated as pointer. It then ensures there's 
+	      still more to be read and uses the PTR_OFFSET() macro to derive a 
+	      pointer from the previously read unsigned byte and another unsigned 
+	      byte.
+	      * This has the potential to increment the buffer position by up to 16383
+	      	bytes or 0x3fff but including a labellen of 0xff and a subsequent read 
+		of 0xff will result in 0x3fff being returned from PTR_OFFSET(). This is
+		subsequently passed in a call to sldns_buffer_set_position() as long as the 
+		resulting pointer value does not equate to or exceed the value returned by 
+		sldns_buffer_limit(). The endpos local var is set to the current position.
+	    * If the label is not determined to be a pointer, the labellen value is 
+	      checked and zero is returned if the value is greater than 0x3f. If 
+  	      incrementing the value of labellen by one turns out to be greater than 
+	      255, zero is returned. There is also a break if the labellen value is 
+	      zero. Zero is also returned if sldns_buffer_remaining() being called on 
+	      the packet returns a value smaller than the labellen value. If the code 
+	      hasn't bailed thus far, sldns_buffer_skip() is called with labellen.
+	    * Before the len is returned, sldns_buffer_set_position() is used to set the 
+	      current position in the packet to the endpos (potentially derived earlier).
+	   * There must be at least 10 bytes remaining in the input buffer.
+	   * The next unsigned 16-bit integer read from the data must not equal 
+	     LDNS_RR_TYPE_OPT (which is essentially 41 in an enumeration in 
+	     sldns/rrdef.h).   
+	   * The edns_present member in the edns_data structure is set to 1, the 
+	     udp_size member is set to the next unsigned 16-bit integer read from the 
+	     data. The ext_rcode member is set to the next unsigned 8-bit integer 
+	     read from the data and the edns_version member is set to the following 
+	     unsigned 8-bit integer that is read. The bits member of the edns_data 
+	     structure is then set to the next unsigned 16-bit integer that is read 
+	     from the request data. Zero is then returned with a comment about ignoring
+	     rdata and rrsigs.
+      * outnet_udp_cb()
+      * outnet_tcp_cb()
+      * tube_handle_listen()
+      * Based on how the binary is built it might be possible to get around 
+      	this check when corrupting memory if a good information leak is 
+	available. Determining the base address of the image may be enough to 
+	determine an appropriate value to use.
+    * If everything checks out, an arbitrary call is made to the callback -- 
+      passing the data buffer (rep.c -- sldns_buffer struct), the callback 
+      args, a NETEVENT_NOERROR constant, and a pointer to the entire comm_reply
+      structure.
+    * If the arbitrary call to the callback succeeds (returns 1 or TRUE), 
+      comm_point_send_udp_msg() is called and provided the same comm_reply 
+      structure (rep).
+    * comm_point_send_udp_msg() sends the entirety of the data pointed to by 
+      the sldns_buffer "packet" that is supplied. This relies upon 
+      sldns_buffer_begin() and sldns_buffer_remaining() in sendto(). 
+      comm_point_send_udp_msg() will return zero if it was unable to send all 
+      of the data in the sendto() call.
+  * listen_start_accept() -- services/listen_dnsport.c
+    * Takes a pointer to a listen_dnsport structure and iterates over the list 
+      of query-listen sockets, calling comm_point_start_listening() only if the
+      comm_point_type of the query-listen port is comm_tcp_accept and the list 
+      of free tcp_handlers for new queries is non-NULL.
+  * listen_stop_accept() -- services/listen_dnsport.c
+  * worker_start_accept() -- smallapp/worker_cb.c
+  * worker_stop_accept() -- smallapp/worker_cb.c
+  * fptr_whitelist_start_accept() -- util/fptr_wlist.c
+  * fptr_whitelist_stop_accept() -- util/ftpr_wlist.c
+  * comm_base_handle_slow_accept() -- util/netevent.c
+  * worker_start_accept() -- libunbound/libworker.c
+  * worker_stop_accept() -- libunbound/libworker.c
+  * daemon_remote_open_accept() -- daemon/remote.c
+  * daemon_remote_stop_accept() -- daemon/remote.c
+  * daemon_remote_start_accept() -- daemon/remote.c
+  * worker_start_accept() -- daemon/worker.c
+  * worker_stop_accept() -- daemon/worker.c
+
+* Review current tests to determine of there are any harnesses that would make 
+  for quick fuzzing opportunities.
+
+* Desirable operations for a simple static source code analyzer:
+  * Function search, by name or signature.
+  * Code coverage tracking with visual representation.
+  * Identification of anomalous conditions in the code:
+    * Statically-sized local arrays.
+    * Unbounded memory copy operations.
+    * Lack of return value checks for memory allocations.
+    * Arithmetic operations being performed in memory allocation calls.
+    * Function-level input taint analysis.
+    * Non-constant format strings provided to format family functions.
+    * Loop constructs that rely on function input for array-indexed writing of memory.
+    * Arithmetic including a combination of signed and unsigned integers.
