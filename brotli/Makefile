@@ -5,7 +5,7 @@ BROTLI_DEC=$(BROTLI_DIR)/dec
 CC=afl-gcc
 CXX=afl-g++
 
-CXFLAGS=-m32 -static -Wall -I$(BROTLI_DIR)
+CXFLAGS=-m32 -Wall -I$(BROTLI_DIR)
 CFLAGS=$(CXFLAGS)
 
 ENC_FUZZER=brotli_compress_fuzz
