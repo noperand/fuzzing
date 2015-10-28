@@ -17,8 +17,8 @@ int main( int argc, char** argv ) {
 
   /* specifics */
   BrotliParams params;
-  size_t output_length = 1.2 * input_stats.st_size + 10240;
-  uint8_t *output = (uint8_t *) malloc(output_length);
+  size_t output_length = 0;
+  uint8_t *output = 0;
 
   if( (ret = stat( argv[1], &input_stats )) != 0) {
     /* printf("error getting stats from file.\n"); */
@@ -32,6 +32,9 @@ int main( int argc, char** argv ) {
   if( (count = fread( input_data, 1, input_stats.st_size, input )) > 0 ) {
     printf("successfully read %d bytes from file.\n", count);
   }
+
+  output_length = 1.2 * input_stats.st_size + 10240;
+  output = (uint8_t *) malloc(output_length);
 
   /* fun stuff */
   BrotliCompressBuffer(params, input_stats.st_size, 
