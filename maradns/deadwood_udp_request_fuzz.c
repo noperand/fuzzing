@@ -40,6 +40,10 @@ int main( int argc, char **argv ) {
     fclose(input);
   if (input_data)
     free(input_data);
+  if (rem) {
+    free(rem);
+    rem = NULL;
+  }
 
   return 0;
 }
